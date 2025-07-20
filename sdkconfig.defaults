@@ -1,0 +1,2 @@
+# Tell ESP-IDF we really have 16 MB
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
