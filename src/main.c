@@ -17,7 +17,11 @@
 static const char* TAG = "ESP_NOW_POWER_TEST";
 
 // CONFIGURE YOUR PEER MAC ADDRESS HERE
-static uint8_t peer_mac[ESP_NOW_ETH_ALEN];// Replace with actual receiver MAC
+static uint8_t peer_mac[ESP_NOW_ETH_ALEN];     // filled at run-time
+
+/* ---------- peer-detection helpers ---------- */
+static bool peer_seen        = false;
+static bool i_am_initiator   = false;
 
 // Pre-shared key for encryption (16 bytes)
 static uint8_t pmk_key[16] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
@@ -26,23 +30,6 @@ static uint8_t pmk_key[16] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
 // Local Master Key for encryption (16 bytes)  
 static uint8_t lmk_key[16] = {0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
                               0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20};
-
-
-/* ---------- board detection ---------- */
-static bool i_am_core2(void)
-{
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    return mac[5] == 0xA8;   // last byte of Core2
-}
-
-static void set_peer_mac(void)
-{
-    if (i_am_core2())
-        memcpy(peer_mac, (uint8_t[]){0x4C,0x75,0x25,0xAD,0x0D,0x94}, 6); /* Atom */
-    else
-        memcpy(peer_mac, (uint8_t[]){0x2C,0xBC,0xBB,0x82,0x91,0xA8}, 6); /* Core2 */
-}
 
 // Test Configuration
 typedef enum {
@@ -110,7 +97,46 @@ static bool full_duplex_active = false;
 RTC_DATA_ATTR size_t rtc_test_index = 0;
 
 // Forward declarations
+static void set_peer_and_role(void);
+static void wait_for_peer(void);
+
+/* ---------- run-time role detection ---------- */
+static void set_peer_and_role(void)
+{
+    uint8_t my_mac[6];
+    esp_read_mac(my_mac, ESP_MAC_WIFI_STA);
+
+    /* Core2 -> initiator, Atom -> responder */
+    i_am_initiator = (my_mac[0] == 0x2C && my_mac[1] == 0xBC && my_mac[2] == 0xBB);
+
+    if (i_am_initiator)
+        memcpy(peer_mac, (uint8_t[]){0x4C,0x75,0x25,0xAD,0x0D,0x94}, 6);
+    else
+        memcpy(peer_mac, (uint8_t[]){0x2C,0xBC,0xBB,0x82,0x91,0xA8}, 6);
+
+    ESP_LOGI(TAG, "Role=%s  peer=" MACSTR,
+             i_am_initiator ? "INITIATOR" : "RESPONDER", MAC2STR(peer_mac));
+}
+
 static void start_full_duplex_sender_task(const test_config_t* test_config, size_t test_index);
+
+/* ---------- peer-detection helpers ---------- */
+static void wait_for_peer(void)
+{
+    ESP_LOGI(TAG, "Waiting for peer to become active...");
+    TickType_t start_time = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(10000); // 10 seconds timeout
+
+    while (!peer_seen && (xTaskGetTickCount() - start_time) < timeout_ticks) {
+        vTaskDelay(pdMS_TO_TICKS(100)); // Check every 100ms
+    }
+
+    if (peer_seen) {
+        ESP_LOGI(TAG, "Peer detected! Proceeding with tests.");
+    } else {
+        ESP_LOGW(TAG, "Peer not detected within timeout. Proceeding anyway.");
+    }
+}
 
 // ESP-NOW send callback function
 static void esp_now_send_cb(const uint8_t *mac_addr, esp_now_send_status_t status)
@@ -142,6 +168,10 @@ static void esp_now_recv_cb(const esp_now_recv_info_t *recv_info, const uint8_t 
         // Log first few bytes for verification
         ESP_LOGI(TAG, "Received data (first 8 bytes): %02X %02X %02X %02X %02X %02X %02X %02X",
                  data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]);
+
+    /* mark peer alive if the frame came from the expected MAC */
+    if (!memcmp(recv_info->src_addr, peer_mac, ESP_NOW_ETH_ALEN))
+        peer_seen = true;
     }
 }
 
@@ -471,28 +501,24 @@ static esp_err_t run_test_case(const test_config_t* test_config, size_t test_ind
 void app_main(void)
 {
     ESP_LOGI(TAG, "ESP-NOW Comprehensive Power Consumption Test Starting...");
-    ESP_LOGI(TAG, "Testing: Simplex, Half-Duplex, and Full-Duplex modes");
+    ESP_LOGI(TAG, "Role-aware test starting – will wait for peer");
     
-    // Initialize NVS
+    /* Initialize NVS */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    set_peer_mac();
-    /* NEW PRINT HERE */
-    uint8_t mac[6];
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    ESP_LOGI(TAG, "My MAC: %02X:%02X:%02X:%02X:%02X:%02X  peer: %02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-             peer_mac[0], peer_mac[1], peer_mac[2],
-             peer_mac[3], peer_mac[4], peer_mac[5]);
-    // Get current test index from RTC memory
-    current_test_index = rtc_test_index;
     
-    ESP_LOGI(TAG, "Current test index: %d (Total tests: %d)", 
-             (int)current_test_index, (int)num_test_cases);
+    /* Get current test index from RTC memory */
+    current_test_index = rtc_test_index;
+    ESP_LOGI(TAG, "Current test index: %d (Total tests: %d)", (int)current_test_index, (int)num_test_cases);
+
+    set_peer_and_role();                  /* choose peer + role */
+    wait_for_peer();                      /* synchronise before first test */
+
+    /* rest of app_main() unchanged … */
     
     // Check if all tests are complete
     if (current_test_index >= num_test_cases) {
